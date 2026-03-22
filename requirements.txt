@@ -1,0 +1,5 @@
+pymupdf
+pillow
+pandas
+tqdm
+langchain-text-splitters

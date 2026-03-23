@@ -65,9 +65,10 @@ def rerank_documents(
     return scored_docs[:top_k]
 
 
-# =========================
+
+# ==========================
 # LLM-BASED SELECTION
-# =========================
+# ==========================
 def llm_select_best_chunks(
     query: str,
     documents: List[Document],

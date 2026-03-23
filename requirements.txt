@@ -1,5 +1,22 @@
+# Core
 pymupdf
 pillow
+numpy
 pandas
 tqdm
+python-docx
+
+# OCR
+easyocr
+opencv-python
+
+# LangChain (modern stack)
+langchain
+lanchain-classic
+langchain-core
+langchain-community
 langchain-text-splitters
+
+# RAG
+faiss-cpu
+sentence-transformers

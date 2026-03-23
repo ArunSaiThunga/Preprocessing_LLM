@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+try:
+    from cleaning import clean_text, remove_repeated_headers_footers
+except ImportError:
+    from src.ingestion.cleaning import clean_text, remove_repeated_headers_footers
+
 import io
 import json
 import re
@@ -8,13 +13,17 @@ from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
+import numpy as np
 from PIL import Image
+import easyocr
+from docx import Document as DocxDocument
 
 
 @dataclass
 class PageRecord:
     source_id: str
     file_name: str
+    file_type: str
     page_number: int
     section: str | None
     timestamp_or_version: str | None
@@ -26,92 +35,24 @@ class PageRecord:
     metadata: dict[str, Any]
 
 
-def normalize_whitespace(text: str) -> str:
-    text = text.replace("\xa0", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def fix_broken_linebreaks(text: str) -> str:
-    # Join lines that were broken in the middle of a sentence
-    text = re.sub(r"(?<![.!?:\n])\n(?![\n•\-\d])", " ", text)
-    return text
-
-
-def remove_repeated_headers_footers(page_texts: list[str]) -> list[str]:
-    """
-    Very simple heuristic:
-    - detect first/last non-empty lines that repeat across many pages
-    - remove them
-    """
-    first_lines = []
-    last_lines = []
-
-    for text in page_texts:
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if not lines:
-            first_lines.append("")
-            last_lines.append("")
-            continue
-        first_lines.append(lines[0])
-        last_lines.append(lines[-1])
-
-    def repeated_candidates(lines: list[str], min_ratio: float = 0.5) -> set[str]:
-        counts = {}
-        for line in lines:
-            if line:
-                counts[line] = counts.get(line, 0) + 1
-        threshold = max(2, int(len(lines) * min_ratio))
-        return {line for line, cnt in counts.items() if cnt >= threshold}
-
-    repeated_first = repeated_candidates(first_lines)
-    repeated_last = repeated_candidates(last_lines)
-
-    cleaned_pages = []
-    for text in page_texts:
-        lines = [ln for ln in text.splitlines()]
-        stripped = [ln.strip() for ln in lines if ln.strip()]
-
-        if not stripped:
-            cleaned_pages.append(text)
-            continue
-
-        output_lines = []
-        first_removed = False
-        last_nonempty_index = max(
-            (i for i, ln in enumerate(lines) if ln.strip()), default=-1
-        )
-
-        for i, line in enumerate(lines):
-            s = line.strip()
-            if not first_removed and s in repeated_first:
-                first_removed = True
-                continue
-            if i == last_nonempty_index and s in repeated_last:
-                continue
-            output_lines.append(line)
-
-        cleaned_pages.append("\n".join(output_lines))
-
-    return cleaned_pages
-
-
 def detect_numeric_content(text: str) -> bool:
-    # crude but useful for KPI-heavy pages
     return bool(re.search(r"\b\d+(?:[.,]\d+)?%?\b", text))
 
 
-def extract_images_from_page(page: fitz.Page, output_dir: Path, page_number: int) -> int:
-    """
-    Saves displayed image blocks from the page (when available).
-    Uses page.get_text('dict'), where image blocks appear with type == 1.
-    """
+def extract_images_from_page(
+    page: fitz.Page,
+    output_dir: Path,
+    page_number: int,
+    file_stem: str,
+    source_id: str,
+) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     page_dict = page.get_text("dict")
     image_blocks = [b for b in page_dict.get("blocks", []) if b.get("type") == 1]
 
     saved = 0
+    safe_stem = re.sub(r"[^a-zA-Z0-9_-]+", "_", file_stem)
+
     for idx, block in enumerate(image_blocks):
         image_bytes = block.get("image")
         ext = block.get("ext", "png")
@@ -120,31 +61,73 @@ def extract_images_from_page(page: fitz.Page, output_dir: Path, page_number: int
 
         try:
             img = Image.open(io.BytesIO(image_bytes))
-            img_path = output_dir / f"page_{page_number+1:03d}_img_{idx+1:02d}.{ext}"
+            img_path = output_dir / (
+                f"{source_id}_{safe_stem}_page_{page_number + 1:03d}_img_{idx + 1:02d}.{ext}"
+            )
             img.save(img_path)
             saved += 1
         except Exception:
-            # skip malformed image blocks
             continue
 
     return saved
 
 
-def extract_page_text(page: fitz.Page, ocr_if_needed: bool = False) -> str:
+def pil_image_to_numpy(img: Image.Image) -> np.ndarray:
+    return np.array(img.convert("RGB"))
+
+
+def ocr_page_with_easyocr(page: fitz.Page, reader: easyocr.Reader) -> str:
     """
-    Start with sorted text for better reading order.
-    If almost no text exists and OCR is enabled, OCR the page.
+    Render PDF page to image and run EasyOCR.
+    """
+    pix = page.get_pixmap(dpi=300)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    img_array = pil_image_to_numpy(img)
+
+    result = reader.readtext(img_array, detail=0, paragraph=False)
+
+    extracted_lines = []
+    for line in result:
+        if isinstance(line, str) and line.strip():
+            extracted_lines.append(line.strip())
+
+    return "\n".join(extracted_lines)
+
+
+def extract_page_text(
+    page: fitz.Page,
+    ocr_reader: easyocr.Reader | None = None,
+    ocr_if_needed: bool = False,
+) -> str:
+    """
+    First try embedded PDF text.
+    If missing or too short, fall back to EasyOCR.
     """
     text = page.get_text("text", sort=True)
 
-    if ocr_if_needed and len(text.strip()) < 30:
+    if ocr_if_needed and len(text.strip()) < 30 and ocr_reader is not None:
+        print(f"Page {page.number + 1}: no embedded text found, trying EasyOCR...")
         try:
-            textpage = page.get_textpage_ocr()
-            text = page.get_text("text", textpage=textpage)
-        except Exception:
-            pass
+            text = ocr_page_with_easyocr(page, ocr_reader)
+            print(f"Page {page.number + 1}: EasyOCR extracted {len(text.strip())} characters")
+        except Exception as e:
+            print(f"Page {page.number + 1}: EasyOCR failed -> {e}")
 
     return text
+
+
+def write_records(records: list[PageRecord], output_jsonl: str | Path) -> None:
+    output_jsonl = Path(output_jsonl)
+    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"Writing {len(records)} record(s) to {output_jsonl}")
+
+    with output_jsonl.open("a", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
+
+    line_count = sum(1 for _ in output_jsonl.open("r", encoding="utf-8"))
+    print(f"File now contains {line_count} line(s)")
 
 
 def ingest_pdf(
@@ -155,24 +138,35 @@ def ingest_pdf(
     section: str | None = None,
     timestamp_or_version: str | None = None,
     domain_category: str | None = None,
-    ocr_if_needed: bool = False,
+    ocr_if_needed: bool = True,
+    ocr_reader: easyocr.Reader | None = None,
 ) -> list[PageRecord]:
     pdf_path = Path(pdf_path)
-    output_jsonl = Path(output_jsonl)
     image_dir = Path(image_dir)
-    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
     doc = fitz.open(pdf_path)
+    print(f"Opened PDF: {pdf_path.name} with {len(doc)} page(s)")
 
     raw_page_texts: list[str] = []
     page_meta: list[dict[str, Any]] = []
     page_images: list[int] = []
 
     for page_number, page in enumerate(doc):
-        text = extract_page_text(page, ocr_if_needed=ocr_if_needed)
+        text = extract_page_text(
+            page,
+            ocr_reader=ocr_reader,
+            ocr_if_needed=ocr_if_needed,
+        )
+        print(f"Page {page_number + 1}: extracted text length = {len(text.strip())}")
         raw_page_texts.append(text)
 
-        img_count = extract_images_from_page(page, image_dir, page_number)
+        img_count = extract_images_from_page(
+            page=page,
+            output_dir=image_dir,
+            page_number=page_number,
+            file_stem=pdf_path.stem,
+            source_id=source_id,
+        )
         page_images.append(img_count)
 
         page_meta.append(
@@ -180,6 +174,7 @@ def ingest_pdf(
                 "page_width": page.rect.width,
                 "page_height": page.rect.height,
                 "rotation": page.rotation,
+                "file_type": "pdf",
             }
         )
 
@@ -187,11 +182,12 @@ def ingest_pdf(
 
     records: list[PageRecord] = []
     for i, text in enumerate(cleaned_page_texts):
-        cleaned = normalize_whitespace(fix_broken_linebreaks(text))
+        cleaned = clean_text(text)
 
         record = PageRecord(
             source_id=source_id,
             file_name=pdf_path.name,
+            file_type="pdf",
             page_number=i + 1,
             section=section,
             timestamp_or_version=timestamp_or_version,
@@ -204,27 +200,219 @@ def ingest_pdf(
         )
         records.append(record)
 
-    with output_jsonl.open("w", encoding="utf-8") as f:
-        for rec in records:
-            f.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
-
+    write_records(records, output_jsonl)
     return records
 
 
+def extract_docx_text(docx_path: str | Path) -> str:
+    """
+    Extract paragraphs + tables from DOCX.
+    """
+    doc = DocxDocument(docx_path)
+    parts: list[str] = []
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            parts.append(text)
+
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+            if row_text:
+                parts.append(row_text)
+
+    return "\n".join(parts)
+
+
+def ingest_docx(
+    docx_path: str | Path,
+    output_jsonl: str | Path,
+    source_id: str,
+    section: str | None = None,
+    timestamp_or_version: str | None = None,
+    domain_category: str | None = None,
+) -> list[PageRecord]:
+    docx_path = Path(docx_path)
+    raw_text = extract_docx_text(docx_path)
+    cleaned = clean_text(raw_text)
+
+    record = PageRecord(
+        source_id=source_id,
+        file_name=docx_path.name,
+        file_type="docx",
+        page_number=1,
+        section=section,
+        timestamp_or_version=timestamp_or_version,
+        domain_category=domain_category,
+        raw_text=raw_text,
+        cleaned_text=cleaned,
+        image_count=0,
+        has_numeric_content=detect_numeric_content(cleaned),
+        metadata={
+            "file_type": "docx",
+            "page_width": None,
+            "page_height": None,
+            "rotation": 0,
+        },
+    )
+
+    records = [record]
+    write_records(records, output_jsonl)
+    return records
+
+
+def read_txt_file(txt_path: str | Path) -> str:
+    txt_path = Path(txt_path)
+
+    encodings_to_try = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
+    for encoding in encodings_to_try:
+        try:
+            return txt_path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+
+    # last fallback
+    return txt_path.read_text(encoding="utf-8", errors="ignore")
+
+
+def ingest_txt(
+    txt_path: str | Path,
+    output_jsonl: str | Path,
+    source_id: str,
+    section: str | None = None,
+    timestamp_or_version: str | None = None,
+    domain_category: str | None = None,
+) -> list[PageRecord]:
+    txt_path = Path(txt_path)
+    raw_text = read_txt_file(txt_path)
+    cleaned = clean_text(raw_text)
+
+    record = PageRecord(
+        source_id=source_id,
+        file_name=txt_path.name,
+        file_type="txt",
+        page_number=1,
+        section=section,
+        timestamp_or_version=timestamp_or_version,
+        domain_category=domain_category,
+        raw_text=raw_text,
+        cleaned_text=cleaned,
+        image_count=0,
+        has_numeric_content=detect_numeric_content(cleaned),
+        metadata={
+            "file_type": "txt",
+            "page_width": None,
+            "page_height": None,
+            "rotation": 0,
+        },
+    )
+
+    records = [record]
+    write_records(records, output_jsonl)
+    return records
+
+
+def ingest_file(
+    file_path: str | Path,
+    output_jsonl: str | Path,
+    image_dir: str | Path,
+    source_id: str,
+    section: str | None = "full_document",
+    timestamp_or_version: str | None = "v1",
+    domain_category: str | None = "enterprise_document",
+    ocr_if_needed: bool = True,
+    ocr_reader: easyocr.Reader | None = None,
+) -> list[PageRecord]:
+    file_path = Path(file_path)
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".pdf":
+        return ingest_pdf(
+            pdf_path=file_path,
+            output_jsonl=output_jsonl,
+            image_dir=image_dir,
+            source_id=source_id,
+            section=section,
+            timestamp_or_version=timestamp_or_version,
+            domain_category=domain_category,
+            ocr_if_needed=ocr_if_needed,
+            ocr_reader=ocr_reader,
+        )
+
+    if suffix == ".docx":
+        return ingest_docx(
+            docx_path=file_path,
+            output_jsonl=output_jsonl,
+            source_id=source_id,
+            section=section,
+            timestamp_or_version=timestamp_or_version,
+            domain_category=domain_category,
+        )
+
+    if suffix == ".txt":
+        return ingest_txt(
+            txt_path=file_path,
+            output_jsonl=output_jsonl,
+            source_id=source_id,
+            section=section,
+            timestamp_or_version=timestamp_or_version,
+            domain_category=domain_category,
+        )
+
+    raise ValueError(f"Unsupported file type: {file_path.suffix}")
+
+
 if __name__ == "__main__":
-    pdf_path = Path(r"D:\30day git\raw_data_preprocessing_for_LLM\data\raw\Arun Sai Thunga Master Thesis.pdf")
+    raw_dir = Path(r"D:\30day git\raw_data_preprocessing_for_LLM\data\raw")
     output_jsonl = Path(r"D:\30day git\raw_data_preprocessing_for_LLM\data\extracted\pages.jsonl")
     image_dir = Path(r"D:\30day git\raw_data_preprocessing_for_LLM\data\extracted\images")
 
-    records = ingest_pdf(
-        pdf_path=pdf_path,
-        output_jsonl=output_jsonl,
-        image_dir=image_dir,
-        source_id="doc_001",
-        section="full_document",
-        timestamp_or_version="v1",
-        domain_category="enterprise_pdf",
-        ocr_if_needed=False,
+    supported_suffixes = {".pdf", ".docx", ".txt"}
+
+    if output_jsonl.exists():
+        output_jsonl.unlink()
+
+    all_files = sorted(
+        [p for p in raw_dir.iterdir() if p.is_file() and p.suffix.lower() in supported_suffixes]
     )
 
-    print(f"Ingested {len(records)} pages")
+    if not all_files:
+        print("No supported files found in data/raw")
+    else:
+        print(f"Found {len(all_files)} supported file(s)")
+
+        needs_ocr = any(p.suffix.lower() == ".pdf" for p in all_files)
+        ocr_reader = None
+
+        if needs_ocr:
+            print("Loading EasyOCR model once for all PDFs...")
+            ocr_reader = easyocr.Reader(["en"], gpu=False)
+
+        all_records: list[PageRecord] = []
+
+        for idx, file_path in enumerate(all_files, start=1):
+            source_id = f"doc_{idx:03d}"
+            print(f"\nProcessing file: {file_path.name}")
+
+            try:
+                records = ingest_file(
+                    file_path=file_path,
+                    output_jsonl=output_jsonl,
+                    image_dir=image_dir,
+                    source_id=source_id,
+                    section="full_document",
+                    timestamp_or_version="v1",
+                    domain_category="enterprise_document",
+                    ocr_if_needed=True,
+                    ocr_reader=ocr_reader,
+                )
+                all_records.extend(records)
+                print(f"Just wrote records for source_id={source_id}, file={file_path.name}")
+                print(f"Finished {file_path.name}: {len(records)} record(s)")
+            except Exception as e:
+                print(f"Failed to process {file_path.name} -> {e}")
+
+        print(f"\nTotal documents processed: {len(all_files)}")
+        print(f"Total records written: {len(all_records)}")
+        print(f"Output saved to: {output_jsonl}")

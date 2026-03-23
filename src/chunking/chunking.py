@@ -88,7 +88,7 @@ def save_chunks(chunks: List[Document], output_path: str | Path):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__": 
 
     input_path = Path("data/extracted/pages.jsonl")
     output_path = Path("data/processed/chunks.jsonl")
